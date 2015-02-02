@@ -5,11 +5,14 @@
 package service
 
 import (
+	"bytes"
 	"fmt"
+	"io/ioutil"
+	"log"
 	"os"
 	"os/exec"
-	"os/signal"
-	"os/user"
+	"path/filepath"
+	"syscall"
 	"text/template"
 	"time"
 
@@ -26,91 +29,87 @@ func (ls darwinSystem) String() string {
 	return version
 }
 
-func (ls darwinSystem) Interactive() bool {
-	return interactive
-}
-
 var system = darwinSystem{}
-
-var interactive = false
-
-func init() {
-	var err error
-	interactive, err = isInteractive()
-	if err != nil {
-		panic(err)
-	}
-}
 
 func isInteractive() (bool, error) {
 	// TODO: The PPID of Launchd is 1. The PPid of a service process should match launchd's PID.
 	return os.Getppid() != 1, nil
 }
 
-func newService(i Interface, c *Config) (*darwinLaunchdService, error) {
+func newService(c Config) (*darwinLaunchdService, error) {
 	s := &darwinLaunchdService{
-		i:      i,
-		Config: c,
+		Config:          c,
+		serviceFilePath: filepath.Join("/Library/LaunchDaemons/", c.Name+".plist"),
+	}
+	if s.Program == "" {
+		program, err := osext.Executable()
+		if err != nil {
+			return nil, fmt.Errorf("Unable to determin program: %v", err)
+		}
+		s.Program = program
 	}
 
 	return s, nil
 }
 
 type darwinLaunchdService struct {
-	i Interface
-	*Config
+	Config
+
+	serviceFilePath string
 }
 
-func (s *darwinLaunchdService) String() string {
-	if len(s.DisplayName) > 0 {
-		return s.DisplayName
+func (s *darwinLaunchdService) InstallOrUpdateRequired() (bool, error) {
+	tmpFile, err := s.prepareTmpFile()
+	if tmpFile != "" {
+		defer os.Remove(tmpFile)
 	}
-	return s.Name
+	if err != nil {
+		return false, err
+	}
+
+	return s.differsFromInstalled(tmpFile)
 }
 
-func (s *darwinLaunchdService) getServiceFilePath() (string, error) {
-	if s.UserService {
-		u, err := user.Current()
-		if err != nil {
-			return "", err
-		}
-		return u.HomeDir + "/Library/LaunchAgents/" + s.Name + ".plist", nil
+func (s *darwinLaunchdService) InstallOrUpdate() (bool, error) {
+	tmpFile, err := s.prepareTmpFile()
+	if tmpFile != "" {
+		defer os.Remove(tmpFile)
 	}
-	return "/Library/LaunchDaemons/" + s.Name + ".plist", nil
+	if err != nil {
+		return false, err
+	}
+
+	installOrUpdateRequired, err := s.differsFromInstalled(tmpFile)
+	if err != nil {
+		return installOrUpdateRequired, err
+	}
+
+	// Move config into place
+	err = os.Rename(tmpFile, s.serviceFilePath)
+	if err != nil {
+		return false, fmt.Errorf("Unable to move service configuration to: %v", err)
+	}
+
+	// Change owner to root
+	err = os.Chown(s.serviceFilePath, 0, 0)
+	if err != nil {
+		return false, fmt.Errorf("Unable to change owner to root: %v", err)
+	}
+
+	err = commandAsRoot("launchctl", "load", s.serviceFilePath).Run()
+	if err != nil {
+		return false, fmt.Errorf("Unable to load service: %v", err)
+	}
+
+	return true, nil
 }
 
-func (s *darwinLaunchdService) Install() error {
-	confPath, err := s.getServiceFilePath()
+func (s *darwinLaunchdService) prepareTmpFile() (string, error) {
+	tmpFile, err := ioutil.TempFile("", "service.plist")
 	if err != nil {
-		return err
+		return "", fmt.Errorf("Unable to create temporary service configuration: %v", err)
 	}
-	_, err = os.Stat(confPath)
-	if err == nil {
-		return fmt.Errorf("Init already exists: %s", confPath)
-	}
-
-	f, err := os.Create(confPath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	path, err := osext.Executable()
-	if err != nil {
-		return err
-	}
-
-	var to = &struct {
-		*Config
-		Path string
-
-		KeepAlive, RunAtLoad bool
-	}{
-		Config:    s.Config,
-		Path:      path,
-		KeepAlive: s.Option.bool("KeepAlive", true),
-		RunAtLoad: s.Option.bool("RunAtLoad", false),
-	}
+	defer tmpFile.Close()
 
 	functions := template.FuncMap{
 		"bool": func(v bool) string {
@@ -121,35 +120,68 @@ func (s *darwinLaunchdService) Install() error {
 		},
 	}
 	t := template.Must(template.New("launchdConfig").Funcs(functions).Parse(launchdConfig))
-	return t.Execute(f, to)
+	err = t.Execute(tmpFile, s)
+	if err != nil {
+		return "", fmt.Errorf("Unable to process service configuration template: %v", err)
+	}
+	err = tmpFile.Chmod(0644)
+	if err != nil {
+		return "", fmt.Errorf("Unable to chmod temp file: %v", err)
+	}
+	err = tmpFile.Close()
+	if err != nil {
+		return "", fmt.Errorf("Unable to close temp file: %v", err)
+	}
+
+	return tmpFile.Name(), nil
+}
+
+func (s *darwinLaunchdService) differsFromInstalled(tmpFile string) (bool, error) {
+	_, err := os.Stat(s.serviceFilePath)
+	if err == nil {
+		// Compare new and old configs
+		old, err := ioutil.ReadFile(s.serviceFilePath)
+		if err != nil {
+			return false, fmt.Errorf("Unable to read existing launchd configuration at %v for comparing: %v", s.serviceFilePath, err)
+		}
+
+		updated, err := ioutil.ReadFile(tmpFile)
+		if err != nil {
+			return false, fmt.Errorf("Unable to read updated launchd configuration at %v for comparing: %v", tmpFile, err)
+		}
+
+		if bytes.Compare(old, updated) == 0 {
+			return false, nil
+		}
+
+		log.Printf("Old and new configurations at %v and %v differ", s.serviceFilePath, tmpFile)
+		time.Sleep(5 * time.Hour)
+	} else if !os.IsNotExist(err) {
+		return false, fmt.Errorf("Unable to stat existing launchd configuration at %v: %v", s.serviceFilePath, err)
+	} else {
+		log.Println("No old configuration found")
+	}
+
+	return true, nil
 }
 
 func (s *darwinLaunchdService) Uninstall() error {
-	s.Stop()
-
-	confPath, err := s.getServiceFilePath()
+	err := exec.Command("sudo", "launchctl", "unload", s.serviceFilePath).Run()
 	if err != nil {
-		return err
+		return fmt.Errorf("Unable to unload service prior to uninstalling: %v", err)
 	}
-	return os.Remove(confPath)
+
+	return os.Remove(s.serviceFilePath)
 }
 
 func (s *darwinLaunchdService) Start() error {
-	confPath, err := s.getServiceFilePath()
-	if err != nil {
-		return err
-	}
-	cmd := exec.Command("launchctl", "load", confPath)
-	return cmd.Run()
+	return commandAsRoot("launchctl", "start", s.Name).Run()
 }
+
 func (s *darwinLaunchdService) Stop() error {
-	confPath, err := s.getServiceFilePath()
-	if err != nil {
-		return err
-	}
-	cmd := exec.Command("launchctl", "unload", confPath)
-	return cmd.Run()
+	return commandAsRoot("launchctl", "stop", s.Name).Run()
 }
+
 func (s *darwinLaunchdService) Restart() error {
 	err := s.Stop()
 	if err != nil {
@@ -159,31 +191,15 @@ func (s *darwinLaunchdService) Restart() error {
 	return s.Start()
 }
 
-func (s *darwinLaunchdService) Run() error {
-	var err error
-
-	err = s.i.Start(s)
-	if err != nil {
-		return err
+func commandAsRoot(name string, args ...string) *exec.Cmd {
+	cmd := exec.Command(name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{
+			Uid: 0,
+			Gid: 0,
+		},
 	}
-
-	var sigChan = make(chan os.Signal, 3)
-
-	signal.Notify(sigChan, os.Interrupt, os.Kill)
-
-	<-sigChan
-
-	return s.i.Stop(s)
-}
-
-func (s *darwinLaunchdService) Logger(errs chan<- error) (Logger, error) {
-	if interactive {
-		return ConsoleLogger, nil
-	}
-	return s.SystemLogger(errs)
-}
-func (s *darwinLaunchdService) SystemLogger(errs chan<- error) (Logger, error) {
-	return newSysLogger(s.Name, errs)
+	return cmd
 }
 
 var launchdConfig = `<?xml version='1.0' encoding='UTF-8'?>
@@ -192,19 +208,25 @@ var launchdConfig = `<?xml version='1.0' encoding='UTF-8'?>
 <plist version='1.0'>
 <dict>
 <key>Label</key><string>{{html .Name}}</string>
+<key>Program</key><string>{{html .Program}}</string>
 <key>ProgramArguments</key>
-<array>
-        <string>{{html .Path}}</string>
-{{range .Config.Arguments}}
+<array>{{range .Config.Arguments}}
         <string>{{html .}}</string>
-{{end}}
-</array>
-{{if .UserName}}<key>UserName</key><string>{{html .UserName}}</string>{{end}}
-{{if .ChRoot}}<key>RootDirectory</key><string>{{html .ChRoot}}</string>{{end}}
+{{end}}</array>
 {{if .WorkingDirectory}}<key>WorkingDirectory</key><string>{{html .WorkingDirectory}}</string>{{end}}
-<key>KeepAlive</key><{{bool .KeepAlive}}/>
-<key>RunAtLoad</key><{{bool .RunAtLoad}}/>
+<key>KeepAlive</key>
+<dict>
+	<key>SuccessfulExit</key>
+	<false/>
+</dict>
+<key>RunAtLoad</key><true/>
 <key>Disabled</key><false/>
+<key>UserName</key>
+<string>root</string>
+<key>GroupName</key>
+<string>wheel</string>
+<key>InitGroups</key>
+<true/>
 </dict>
 </plist>
 `
