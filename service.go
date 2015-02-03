@@ -42,7 +42,7 @@ type Service interface {
 	//
 	// Returns true if the service was installed or updated, false if it was
 	// left alone.
-	InstallOrUpdate() (bool, error)
+	InstallOrUpdate(run func() error) (bool, error)
 
 	// Uninstall uninstalls the given service from the OS service manager. This may require
 	// greater rights. Will return an error if the service is not present.

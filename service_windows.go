@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -22,17 +23,11 @@ import (
 const version = "Windows Service"
 
 type windowsService struct {
-	i Interface
+	run func() error
 	*Config
 
 	errSync      sync.Mutex
 	stopStartErr error
-}
-
-// WindowsLogger allows using windows specific logging methods.
-type WindowsLogger struct {
-	ev   *eventlog.Log
-	errs chan<- error
 }
 
 type windowsSystem struct{}
@@ -40,72 +35,12 @@ type windowsSystem struct{}
 func (windowsSystem) String() string {
 	return version
 }
-func (windowsSystem) Interactive() bool {
-	return interactive
-}
 
 var system = windowsSystem{}
 
-func (l WindowsLogger) send(err error) error {
-	if err == nil {
-		return nil
-	}
-	if l.errs != nil {
-		l.errs <- err
-	}
-	return err
-}
-func (l WindowsLogger) Error(v ...interface{}) error {
-	return l.send(l.ev.Error(3, fmt.Sprint(v...)))
-}
-func (l WindowsLogger) Warning(v ...interface{}) error {
-	return l.send(l.ev.Warning(2, fmt.Sprint(v...)))
-}
-func (l WindowsLogger) Info(v ...interface{}) error {
-	return l.send(l.ev.Info(1, fmt.Sprint(v...)))
-}
-func (l WindowsLogger) Errorf(format string, a ...interface{}) error {
-	return l.send(l.ev.Error(3, fmt.Sprintf(format, a...)))
-}
-func (l WindowsLogger) Warningf(format string, a ...interface{}) error {
-	return l.send(l.ev.Warning(2, fmt.Sprintf(format, a...)))
-}
-func (l WindowsLogger) Infof(format string, a ...interface{}) error {
-	return l.send(l.ev.Info(1, fmt.Sprintf(format, a...)))
-}
-
-func (l WindowsLogger) NError(eventId uint32, v ...interface{}) error {
-	return l.send(l.ev.Error(eventId, fmt.Sprint(v...)))
-}
-func (l WindowsLogger) NWarning(eventId uint32, v ...interface{}) error {
-	return l.send(l.ev.Warning(eventId, fmt.Sprint(v...)))
-}
-func (l WindowsLogger) NInfo(eventId uint32, v ...interface{}) error {
-	return l.send(l.ev.Info(eventId, fmt.Sprint(v...)))
-}
-func (l WindowsLogger) NErrorf(eventId uint32, format string, a ...interface{}) error {
-	return l.send(l.ev.Error(eventId, fmt.Sprintf(format, a...)))
-}
-func (l WindowsLogger) NWarningf(eventId uint32, format string, a ...interface{}) error {
-	return l.send(l.ev.Warning(eventId, fmt.Sprintf(format, a...)))
-}
-func (l WindowsLogger) NInfof(eventId uint32, format string, a ...interface{}) error {
-	return l.send(l.ev.Info(eventId, fmt.Sprintf(format, a...)))
-}
-
-var interactive = false
-
-func init() {
-	var err error
-	interactive, err = svc.IsAnInteractiveSession()
-	if err != nil {
-		panic(err)
-	}
-}
-
-func newService(i Interface, c *Config) (*windowsService, error) {
+func newService(run func() error, c *Config) (*windowsService, error) {
 	ws := &windowsService{
-		i:      i,
+		run:    run,
 		Config: c,
 	}
 	return ws, nil
@@ -123,6 +58,7 @@ func (ws *windowsService) setError(err error) {
 	defer ws.errSync.Unlock()
 	ws.stopStartErr = err
 }
+
 func (ws *windowsService) getError() error {
 	ws.errSync.Lock()
 	defer ws.errSync.Unlock()
@@ -133,7 +69,7 @@ func (ws *windowsService) Execute(args []string, r <-chan svc.ChangeRequest, cha
 	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown
 	changes <- svc.Status{State: svc.StartPending}
 
-	if err := ws.i.Start(ws); err != nil {
+	if err := ws.run(); err != nil {
 		ws.setError(err)
 		return true, 1
 	}
@@ -160,10 +96,10 @@ loop:
 	return false, 0
 }
 
-func (ws *windowsService) Install() error {
+func (ws *windowsService) InstallOrUpdate() (bool, error) {
 	exepath, err := osext.Executable()
 	if err != nil {
-		return err
+		return false, err
 	}
 	binPath := &bytes.Buffer{}
 	// Quote exe path in case it contains a string.
@@ -181,7 +117,7 @@ func (ws *windowsService) Install() error {
 	}
 	m, err := mgr.Connect()
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer m.Disconnect()
 	s, err := m.OpenService(ws.Name)
@@ -189,23 +125,31 @@ func (ws *windowsService) Install() error {
 		s.Close()
 		return fmt.Errorf("service %s already exists", ws.Name)
 	}
-	s, err = m.CreateService(ws.Name, binPath.String(), mgr.Config{
-		DisplayName:      ws.DisplayName,
-		Description:      ws.Description,
+	cfg := mgr.Config{
+		// DisplayName:      ws.Name,
+		// Description:      ws.Name,
 		StartType:        mgr.StartAutomatic,
-		ServiceStartName: ws.UserName,
-		Password:         ws.Option.string("Password", ""),
-	})
+		ServiceStartName: "Administrator",
+	}
+	s, err = m.OpenService(ws.Name)
+	if err == nil {
+		oldCfg, err := s.Config()
+		if err == nil && reflect.DeepEqual(cfg, oldCfg) {
+			// Service unchanged
+			return false, nil
+		}
+	}
+	s, err = m.CreateService(ws.Name, binPath.String(), cfg)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer s.Close()
 	err = eventlog.InstallAsEventCreate(ws.Name, eventlog.Error|eventlog.Warning|eventlog.Info)
 	if err != nil {
 		s.Delete()
-		return fmt.Errorf("InstallAsEventCreate() failed: %s", err)
+		return false, fmt.Errorf("InstallAsEventCreate() failed: %s", err)
 	}
-	return nil
+	return true, nil
 }
 
 func (ws *windowsService) Uninstall() error {
