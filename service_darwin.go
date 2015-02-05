@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"syscall"
 	"text/template"
@@ -81,7 +82,7 @@ func (s *darwinLaunchdService) InstallOrUpdate() (bool, error) {
 
 	installOrUpdateRequired, err := s.differsFromInstalled(tmpFile)
 	if err != nil {
-		return installOrUpdateRequired, err
+		return installOrUpdateRequired, fmt.Errorf("Unable to determine if new configuration differs from old: %v", err)
 	}
 
 	// Move config into place
@@ -189,6 +190,27 @@ func (s *darwinLaunchdService) Restart() error {
 	}
 	time.Sleep(50 * time.Millisecond)
 	return s.Start()
+}
+
+func (s *darwinLaunchdService) Run() error {
+	var err error
+
+	err = s.Config.Start()
+	if err != nil {
+		return err
+	}
+
+	var sigChan = make(chan os.Signal, 3)
+
+	signal.Notify(sigChan, os.Interrupt, os.Kill)
+
+	<-sigChan
+
+	if s.Config.Stop == nil {
+		return nil
+	}
+
+	return s.Config.Stop()
 }
 
 func commandAsRoot(name string, args ...string) *exec.Cmd {

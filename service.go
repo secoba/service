@@ -12,11 +12,13 @@ import (
 
 // Config provides the setup for a Service. The Name field is required.
 type Config struct {
-	Name             string   // Required name of the service. No spaces suggested.
-	Privileged       bool     // If true, service will run as root/Administrator/etc
-	Program          string   // The name of the program, defaults to the current program
-	Arguments        []string // Run with arguments.
-	WorkingDirectory string   // Optional, service working directory
+	Name             string       // Required name of the service. No spaces suggested.
+	Privileged       bool         // If true, service will run as root/Administrator/etc
+	Program          string       // The name of the program, defaults to the current program
+	Arguments        []string     // Run with arguments.
+	WorkingDirectory string       // Optional, service working directory
+	Start            func() error // Required, function that starts the service (must not block)
+	Stop             func() error // Optional, function that gets called when the service is stopping
 }
 
 // Service represents a service that can be run or controlled.
@@ -42,11 +44,14 @@ type Service interface {
 	//
 	// Returns true if the service was installed or updated, false if it was
 	// left alone.
-	InstallOrUpdate(run func() error) (bool, error)
+	InstallOrUpdate() (bool, error)
 
 	// Uninstall uninstalls the given service from the OS service manager. This may require
 	// greater rights. Will return an error if the service is not present.
 	Uninstall() error
+
+	// Run runs the service
+	Run() error
 }
 
 var errNameFieldRequired = errors.New("Config.Name field is required.")

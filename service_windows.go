@@ -7,8 +7,6 @@ package service
 import (
 	"bytes"
 	"fmt"
-	"os"
-	"os/signal"
 	"reflect"
 	"strings"
 	"sync"
@@ -23,8 +21,7 @@ import (
 const version = "Windows Service"
 
 type windowsService struct {
-	run func() error
-	*Config
+	Config
 
 	errSync      sync.Mutex
 	stopStartErr error
@@ -38,18 +35,14 @@ func (windowsSystem) String() string {
 
 var system = windowsSystem{}
 
-func newService(run func() error, c *Config) (*windowsService, error) {
+func newService(c Config) (*windowsService, error) {
 	ws := &windowsService{
-		run:    run,
 		Config: c,
 	}
 	return ws, nil
 }
 
 func (ws *windowsService) String() string {
-	if len(ws.DisplayName) > 0 {
-		return ws.DisplayName
-	}
 	return ws.Name
 }
 
@@ -69,7 +62,7 @@ func (ws *windowsService) Execute(args []string, r <-chan svc.ChangeRequest, cha
 	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown
 	changes <- svc.Status{State: svc.StartPending}
 
-	if err := ws.run(); err != nil {
+	if err := ws.Config.Start(); err != nil {
 		ws.setError(err)
 		return true, 1
 	}
@@ -83,9 +76,11 @@ loop:
 			changes <- c.CurrentStatus
 		case svc.Stop, svc.Shutdown:
 			changes <- svc.Status{State: svc.StopPending}
-			if err := ws.i.Stop(ws); err != nil {
-				ws.setError(err)
-				return true, 2
+			if ws.Config.Stop != nil {
+				if err := ws.Config.Stop(); err != nil {
+					ws.setError(err)
+					return true, 2
+				}
 			}
 			break loop
 		default:
@@ -96,60 +91,112 @@ loop:
 	return false, 0
 }
 
-func (ws *windowsService) InstallOrUpdate() (bool, error) {
-	exepath, err := osext.Executable()
-	if err != nil {
-		return false, err
-	}
-	binPath := &bytes.Buffer{}
-	// Quote exe path in case it contains a string.
-	binPath.WriteRune('"')
-	binPath.WriteString(exepath)
-	binPath.WriteRune('"')
-
-	// Arguments are encoded with the binary path to service.
-	// Enclose arguments in quotes. Escape quotes with a backslash.
-	for _, arg := range ws.Arguments {
-		binPath.WriteRune(' ')
-		binPath.WriteString(`"`)
-		binPath.WriteString(strings.Replace(arg, `"`, `\"`, -1))
-		binPath.WriteString(`"`)
+func (ws *windowsService) InstallOrUpdateRequired() (bool, error) {
+	if true {
+		return true, nil
 	}
 	m, err := mgr.Connect()
 	if err != nil {
 		return false, err
 	}
 	defer m.Disconnect()
-	s, err := m.OpenService(ws.Name)
-	if err == nil {
-		s.Close()
-		return fmt.Errorf("service %s already exists", ws.Name)
-	}
-	cfg := mgr.Config{
-		// DisplayName:      ws.Name,
-		// Description:      ws.Name,
-		StartType:        mgr.StartAutomatic,
-		ServiceStartName: "Administrator",
-	}
-	s, err = m.OpenService(ws.Name)
-	if err == nil {
-		oldCfg, err := s.Config()
-		if err == nil && reflect.DeepEqual(cfg, oldCfg) {
-			// Service unchanged
-			return false, nil
-		}
-	}
-	s, err = m.CreateService(ws.Name, binPath.String(), cfg)
+
+	s, oldCfg, err := ws.existingSvcAndConfig(m)
 	if err != nil {
 		return false, err
 	}
-	defer s.Close()
-	err = eventlog.InstallAsEventCreate(ws.Name, eventlog.Error|eventlog.Warning|eventlog.Info)
-	if err != nil {
-		s.Delete()
-		return false, fmt.Errorf("InstallAsEventCreate() failed: %s", err)
+	if s == nil {
+		return true, nil
 	}
-	return true, nil
+
+	cfg, err := ws.buildConfig()
+	if err != nil {
+		return false, err
+	}
+
+	return !reflect.DeepEqual(cfg, oldCfg), nil
+}
+
+func (ws *windowsService) InstallOrUpdate() (bool, error) {
+	m, err := mgr.Connect()
+	if err != nil {
+		return false, fmt.Errorf("Unable to connect to service manager: %v", err)
+	}
+	defer m.Disconnect()
+
+	cfg, err := ws.buildConfig()
+	if err != nil {
+		return false, fmt.Errorf("Unable to build config: %v", err)
+	}
+
+	s, oldCfg, err := ws.existingSvcAndConfig(m)
+	if err != nil {
+		return false, fmt.Errorf("Unable to get existing service and config: %v", err)
+	}
+	if s != nil && reflect.DeepEqual(cfg, oldCfg) {
+		// Service already exists and doesn't need updating
+		return false, nil
+	}
+
+	if s == nil {
+		exepath, err := osext.Executable()
+		if err != nil {
+			return false, fmt.Errorf("Unable to determine executable: %v", err)
+		}
+
+		binPath := &bytes.Buffer{}
+		// Quote exe path in case it contains a string.
+		binPath.WriteRune('"')
+		binPath.WriteString(exepath)
+		binPath.WriteRune('"')
+
+		// Arguments are encoded with the binary path to service.
+		// Enclose arguments in quotes. Escape quotes with a backslash.
+		for _, arg := range ws.Arguments {
+			binPath.WriteRune(' ')
+			binPath.WriteString(`"`)
+			binPath.WriteString(strings.Replace(arg, `"`, `\"`, -1))
+			binPath.WriteString(`"`)
+		}
+		s, err = m.CreateService(ws.Name, binPath.String(), cfg)
+		if err != nil {
+			return false, fmt.Errorf("Unable to create service: %v", err)
+		}
+		defer s.Close()
+		return false, ws.doStart(m)
+	} else {
+		defer s.Close()
+		err = s.UpdateConfig(cfg)
+		if err != nil {
+			return false, fmt.Errorf("Unable to update config: %v", err)
+		}
+		return true, nil
+	}
+}
+
+func (ws *windowsService) buildConfig() (mgr.Config, error) {
+	cfg := mgr.Config{
+		DisplayName:      ws.Name,
+		Description:      ws.Name,
+		StartType:        mgr.StartAutomatic,
+		ServiceStartName: ".\\LocalSystem",
+	}
+
+	return cfg, nil
+}
+
+func (ws *windowsService) existingSvcAndConfig(m *mgr.Mgr) (*mgr.Service, mgr.Config, error) {
+	s, err := m.OpenService(ws.Name)
+	if err != nil {
+		return nil, mgr.Config{}, nil
+	}
+
+	oldCfg, err := s.Config()
+	if err != nil {
+		return s, mgr.Config{}, err
+	}
+
+	return s, oldCfg, nil
 }
 
 func (ws *windowsService) Uninstall() error {
@@ -176,33 +223,20 @@ func (ws *windowsService) Uninstall() error {
 
 func (ws *windowsService) Run() error {
 	ws.setError(nil)
-	if !interactive {
-		// Return error messages from start and stop routines
-		// that get executed in the Execute method.
-		// Guarded with a mutex as it may run a different thread
-		// (callback from windows).
-		runErr := svc.Run(ws.Name, ws)
-		startStopErr := ws.getError()
-		if startStopErr != nil {
-			return startStopErr
-		}
-		if runErr != nil {
-			return runErr
-		}
-		return nil
+
+	// Return error messages from start and stop routines
+	// that get executed in the Execute method.
+	// Guarded with a mutex as it may run a different thread
+	// (callback from windows).
+	runErr := svc.Run(ws.Name, ws)
+	startStopErr := ws.getError()
+	if startStopErr != nil {
+		return startStopErr
 	}
-	err := ws.i.Start(ws)
-	if err != nil {
-		return err
+	if runErr != nil {
+		return runErr
 	}
-
-	sigChan := make(chan os.Signal)
-
-	signal.Notify(sigChan, os.Interrupt, os.Kill)
-
-	<-sigChan
-
-	return ws.i.Stop(ws)
+	return nil
 }
 
 func (ws *windowsService) Start() error {
@@ -211,7 +245,10 @@ func (ws *windowsService) Start() error {
 		return err
 	}
 	defer m.Disconnect()
+	return nil
+}
 
+func (ws *windowsService) doStart(m *mgr.Mgr) error {
 	s, err := m.OpenService(ws.Name)
 	if err != nil {
 		return err
@@ -243,17 +280,4 @@ func (ws *windowsService) Restart() error {
 	}
 	time.Sleep(50 * time.Millisecond)
 	return ws.Start()
-}
-func (ws *windowsService) Logger(errs chan<- error) (Logger, error) {
-	if interactive {
-		return ConsoleLogger, nil
-	}
-	return ws.SystemLogger(errs)
-}
-func (ws *windowsService) SystemLogger(errs chan<- error) (Logger, error) {
-	el, err := eventlog.Open(ws.Name)
-	if err != nil {
-		return nil, err
-	}
-	return WindowsLogger{el, errs}, nil
 }
