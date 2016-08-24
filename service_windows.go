@@ -13,9 +13,9 @@ import (
 	"time"
 
 	"bitbucket.org/kardianos/osext"
-	"code.google.com/p/winsvc/eventlog"
-	"code.google.com/p/winsvc/mgr"
-	"code.google.com/p/winsvc/svc"
+	"github.com/getlantern/winsvc/eventlog"
+	"github.com/getlantern/winsvc/mgr"
+	"github.com/getlantern/winsvc/svc"
 )
 
 const version = "Windows Service"
