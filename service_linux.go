@@ -14,7 +14,7 @@ import (
 	"text/template"
 	"time"
 
-	"bitbucket.org/kardianos/osext"
+	"github.com/kardianos/osext"
 )
 
 const (
@@ -48,7 +48,7 @@ func isSystemd() bool {
 }
 
 type linuxService struct {
-	i Interface
+	i interface{}
 	*Config
 
 	interactive bool
@@ -68,7 +68,7 @@ func (ls linuxSystem) Interactive() bool {
 
 var system = linuxSystem{}
 
-func newService(i Interface, c *Config) (Service, error) {
+func newService(i interface{}, c *Config) (Service, error) {
 	s := &linuxService{
 		i:      i,
 		Config: c,
